@@ -146,7 +146,8 @@ static std::atomic<bool> gOutPipeReady {false};
 static bool gShowHelp = true; // draw help text overlay in windowed mode for user guidance
 static HHOOK gLLHook = nullptr; // low-level keyboard hook for Alt combos
 // Allow multiple simultaneous inbound clients to avoid ERROR_PIPE_BUSY.
-static const int kMaxInboundInstances = 16;
+static const int kMaxInboundInstances = 16; // maximum instances parameter passed to CreateNamedPipe
+static const int kInboundListenerCount = 8; // number of concurrent listener threads (simultaneous pending ConnectNamedPipe)
 // Performance metrics
 static std::atomic<double> gAvgFrameMs {16.0};
 static std::atomic<double> gLastFPS {60.0};
@@ -452,10 +453,9 @@ static void InboundClientHandler(HANDLE hPipe) {
     CloseHandle(hPipe);
 }
 
-// Accept loop creating pipe instances and spawning handler threads.
-void InboundAcceptLoop() {
+// Individual listener worker: waits for a client, hands off to handler synchronously, then loops.
+static void InboundListenerWorker(int idx) {
     const wchar_t *pipeName = L"\\\\.\\pipe\\SwarmPipe";
-    printf("Inbound pipe multi-instance server starting (max %d concurrent).\n", kMaxInboundInstances);
     while(gManager.running) {
         HANDLE hPipe = CreateNamedPipeW(
             pipeName,
@@ -465,18 +465,28 @@ void InboundAcceptLoop() {
             4096, 4096, 0, nullptr);
         if(hPipe==INVALID_HANDLE_VALUE) {
             DWORD gle = GetLastError();
-            printf("CreateNamedPipe inbound failed gle=%lu\n", gle);
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if((idx==0)) printf("Inbound listener %d CreateNamedPipe failed gle=%lu\n", idx, gle);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
         BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError()==ERROR_PIPE_CONNECTED);
         if(connected) {
-            std::thread(InboundClientHandler, hPipe).detach();
+            // Handle in current thread (limits threads to listener count)
+            InboundClientHandler(hPipe); // closes handle internally
         } else {
             CloseHandle(hPipe);
         }
-        // loop immediately to create another instance so clients can connect concurrently
     }
+}
+
+// Launch a pool of listener workers so multiple clients can connect simultaneously without transient ERROR_PIPE_BUSY.
+void InboundListenerPool() {
+    printf("Inbound pipe server pool starting with %d listeners (max instances %d).\n", kInboundListenerCount, kMaxInboundInstances);
+    std::vector<std::thread> workers; workers.reserve(kInboundListenerCount);
+    for(int i=0;i<kInboundListenerCount;i++) workers.emplace_back(InboundListenerWorker, i);
+    while(gManager.running) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    // Shutdown: listeners will exit after gManager.running becomes false (may remain blocked until a client connects); we detach after a timeout to avoid hang.
+    for(auto &t : workers) { if(t.joinable()) t.detach(); }
 }
 
 void OutPipeThread() {
@@ -746,7 +756,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     LoadState();
 
     std::thread updater(UpdateThread);
-    std::thread pipeServer(InboundAcceptLoop);
+    std::thread pipeServer(InboundListenerPool);
     std::thread outPipe(OutPipeThread);
     std::thread hotReload(HotReloadThread);
     std::thread heartbeat(HeartbeatThread);

@@ -56,3 +56,6 @@ venv/
 
 # Node modules (future tooling)
 node_modules/
+
+# Heartbeat
+swarm_heartbeat.txt
