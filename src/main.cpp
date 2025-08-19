@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <atomic>
+#include <chrono>
 
 /*
  Swarm prototype
@@ -145,6 +147,22 @@ static bool gShowHelp = true; // draw help text overlay in windowed mode for use
 static HHOOK gLLHook = nullptr; // low-level keyboard hook for Alt combos
 // Allow multiple simultaneous inbound clients to avoid ERROR_PIPE_BUSY.
 static const int kMaxInboundInstances = 16;
+// Performance metrics
+static std::atomic<double> gAvgFrameMs {16.0};
+static std::atomic<double> gLastFPS {60.0};
+// Heartbeat control
+static std::atomic<bool> gHeartbeatRunning {true};
+static const char* kStateFile = "swarm_state.jsonl";
+static const char* kConfigFile = "swarm_config.jsonl";
+static const char* kHeartbeatFile = "swarm_heartbeat.txt";
+static std::atomic<int> gApiCommandCount {0};
+
+// Forward declarations for new helpers
+void SaveState();
+void LoadState();
+POINT GetCursorPosForId(int id, bool *ok);
+void PerformMouseAction(POINT p, const std::string &action, int button);
+void ReloadConfigIfChanged(bool force=false);
 
 // Forward declarations
 // (keyboard hook & overlay key handling removed)
@@ -260,6 +278,7 @@ void handleCommand(const std::string &line) {
     auto cmdIt = kv.find("cmd"); if(cmdIt==kv.end()) return;
     std::string cmd = cmdIt->second;
     printf("IPC command line: %s\n", line.c_str());
+    gApiCommandCount++;
     if(cmd=="add") {
         SwarmCursor c; c.size=12; c.color=RGB(0,200,255);
         if(kv.count("color")) c.color = parseColor(kv["color"]);
@@ -364,6 +383,54 @@ void handleCommand(const std::string &line) {
         sendOut("{\"event\":\"exiting\"}\n");
         gManager.running = false;
         if(gManager.overlayWnd) PostMessage(gManager.overlayWnd, WM_CLOSE, 0, 0);
+    } else if(cmd=="click" || cmd=="clickId" || cmd=="downId" || cmd=="upId" || cmd=="dragId") {
+        int id = kv.count("id") ? atoi(kv["id"].c_str()) : 0;
+        bool ok=false; POINT p = GetCursorPosForId(id, &ok);
+        if(!ok) { printf("Mouse action: invalid id=%d\n", id); return; }
+        int button = kv.count("button") ? atoi(kv["button"].c_str()) : 0; // 0=left,1=right,2=middle
+        if(cmd=="click") {
+            PerformMouseAction(p, "down", button); PerformMouseAction(p, "up", button);
+        } else if(cmd=="clickId") {
+            PerformMouseAction(p, "down", button); PerformMouseAction(p, "up", button);
+        } else if(cmd=="downId") {
+            PerformMouseAction(p, "down", button);
+        } else if(cmd=="upId") {
+            PerformMouseAction(p, "up", button);
+        } else if(cmd=="dragId") {
+            // dragId requires dx & dy or tx & ty absolute target
+            POINT target = p;
+            if(kv.count("tx") && kv.count("ty")) { target.x = atol(kv["tx"].c_str()); target.y = atol(kv["ty"].c_str()); }
+            else if(kv.count("dx") && kv.count("dy")) { target.x += atol(kv["dx"].c_str()); target.y += atol(kv["dy"].c_str()); }
+            PerformMouseAction(p, "down", button);
+            SetCursorPos(target.x, target.y);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            PerformMouseAction(target, "up", button);
+        }
+    } else if(cmd=="perf") {
+        char buf[256];
+        snprintf(buf,sizeof(buf),"{\"event\":\"perf\",\"fps\":%.1f,\"avgFrameMs\":%.3f,\"cursorCount\":%zu,\"apiCount\":%d}\n", gLastFPS.load(), gAvgFrameMs.load(), gManager.cursors.size(), gApiCommandCount.load());
+        sendOut(buf);
+    } else if(cmd=="save") {
+        SaveState();
+    } else if(cmd=="load") {
+        LoadState();
+    } else if(cmd=="reload") {
+        ReloadConfigIfChanged(true);
+    } else if(cmd=="tweak") {
+        if(!kv.count("id")) return; int id = atoi(kv["id"].c_str());
+        std::lock_guard<std::mutex> lock(gManager.mtx);
+        for(auto &c : gManager.cursors) if(c.id==id) {
+            if(kv.count("radius")) c.radius = atof(kv["radius"].c_str());
+            if(kv.count("radiusDelta")) c.radius += atof(kv["radiusDelta"].c_str());
+            if(kv.count("speed")) c.speed = atof(kv["speed"].c_str());
+            if(kv.count("speedDelta")) c.speed += atof(kv["speedDelta"].c_str());
+            if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
+            if(kv.count("offsetX")) c.offsetX = atof(kv["offsetX"].c_str());
+            if(kv.count("offsetY")) c.offsetY = atof(kv["offsetY"].c_str());
+            if(kv.count("size")) { int s=atoi(kv["size"].c_str()); if(s>2 && s<400) c.size=s; }
+            if(kv.count("color")) c.color = parseColor(kv["color"]);
+            char buf2[200]; snprintf(buf2,sizeof(buf2),"{\"event\":\"tweaked\",\"id\":%d}\n", id); sendOut(buf2); break;
+        }
     }
 }
 
@@ -537,6 +604,7 @@ HWND CreateOverlayWindow(HINSTANCE hInst) {
 
 void UpdateThread() {
     auto last = std::chrono::high_resolution_clock::now();
+    double emaMs = 16.0;
     while(gManager.running) {
         auto now = std::chrono::high_resolution_clock::now();
         double dt = std::chrono::duration<double>(now-last).count();
@@ -545,8 +613,90 @@ void UpdateThread() {
     // (windowed mode removed; system cursor coords used directly)
         gManager.updateAll(dt, p);
         if(gManager.overlayWnd) InvalidateRect(gManager.overlayWnd, nullptr, FALSE);
+        double frameMs = dt*1000.0;
+        emaMs = emaMs*0.9 + frameMs*0.1;
+        gAvgFrameMs = emaMs;
+        if(emaMs>0.01) gLastFPS = 1000.0/emaMs;
         std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60fps
     }
+}
+
+static std::atomic<std::filesystem::file_time_type> gLastConfigTime;
+
+void ReloadConfigIfChanged(bool force) {
+    try {
+        if(std::filesystem::exists(kConfigFile)) {
+            auto mod = std::filesystem::last_write_time(kConfigFile);
+            if(force || gLastConfigTime.load() != mod) {
+                gLastConfigTime = mod;
+                printf("Hot-reload: reloading %s\n", kConfigFile);
+                std::ifstream in(kConfigFile, std::ios::in);
+                if(in) {
+                    std::string line; while(std::getline(in,line)) { if(line.empty()|| line[0]=='#') continue; handleCommand(line); }
+                }
+            }
+        }
+    } catch(...) { /* ignore */ }
+}
+
+void HotReloadThread() {
+    while(gManager.running) {
+        ReloadConfigIfChanged(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(750));
+    }
+}
+
+void HeartbeatThread() {
+    while(gManager.running && gHeartbeatRunning) {
+        std::ofstream hb(kHeartbeatFile, std::ios::out|std::ios::trunc);
+        if(hb) {
+            auto now = std::chrono::system_clock::now().time_since_epoch();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+            hb << ms << "\n" << gLastFPS.load() << "\n" << gManager.cursors.size() << std::endl;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+POINT GetCursorPosForId(int id, bool *ok) {
+    *ok=false; POINT p{0,0};
+    std::lock_guard<std::mutex> lock(gManager.mtx);
+    for(auto &c: gManager.cursors) if(c.id==id) { p=c.pos; *ok=true; break; }
+    return p;
+}
+
+void PerformMouseAction(POINT p, const std::string &action, int button) {
+    INPUT inp{}; inp.type = INPUT_MOUSE;
+    SetCursorPos(p.x, p.y);
+    DWORD downFlag = MOUSEEVENTF_LEFTDOWN, upFlag = MOUSEEVENTF_LEFTUP;
+    if(button==1) { downFlag = MOUSEEVENTF_RIGHTDOWN; upFlag=MOUSEEVENTF_RIGHTUP; }
+    else if(button==2) { downFlag = MOUSEEVENTF_MIDDLEDOWN; upFlag=MOUSEEVENTF_MIDDLEUP; }
+    if(action=="down") inp.mi.dwFlags = downFlag; else if(action=="up") inp.mi.dwFlags = upFlag; else return;
+    SendInput(1,&inp,sizeof(INPUT));
+}
+
+void SaveState() {
+    std::lock_guard<std::mutex> lock(gManager.mtx);
+    std::ofstream out(kStateFile, std::ios::out|std::ios::trunc);
+    if(!out) { printf("SaveState: failed open %s\n", kStateFile); return; }
+    for(auto &c: gManager.cursors) {
+        out << "{\"cmd\":\"add\",\"id\":" << c.id
+            << ",\"behavior\":\"" << (c.behavior==BehaviorType::Mirror?"mirror":(c.behavior==BehaviorType::Static?"static":(c.behavior==BehaviorType::Orbit?"orbit":"follow"))) << "\""
+            << ",\"offsetX\":" << c.offsetX << ",\"offsetY\":" << c.offsetY
+            << ",\"radius\":" << c.radius << ",\"speed\":" << c.speed
+            << ",\"lagMs\":" << c.lagMs << ",\"x\":" << c.target.x << ",\"y\":" << c.target.y
+            << ",\"size\":" << c.size
+            << "}\n";
+    }
+    printf("State saved (%zu cursors) to %s\n", gManager.cursors.size(), kStateFile);
+}
+
+void LoadState() {
+    if(!std::filesystem::exists(kStateFile)) { printf("LoadState: file not found %s\n", kStateFile); return; }
+    std::ifstream in(kStateFile, std::ios::in);
+    if(!in) return;
+    printf("Loading state from %s\n", kStateFile);
+    std::string line; while(std::getline(in,line)) { if(line.empty()|| line[0]=='#') continue; handleCommand(line); }
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
@@ -592,24 +742,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Do NOT force focus; user can Alt+Tab freely. (Focus only needed for fallback keys in windowed mode.)
 
     // Load config file (line-delimited JSON commands) if present
-    const char *cfgName = "swarm_config.jsonl";
-    if(std::filesystem::exists(cfgName)) {
-        std::ifstream in(cfgName, std::ios::in);
-        if(in) {
-            std::string line; int count=0;
-            while(std::getline(in, line)) {
-                if(line.empty()) continue;
-                if(line[0]=='#') continue;
-                handleCommand(line);
-                count++;
-            }
-            printf("Loaded %d config lines from %s\n", count, cfgName);
-        }
-    }
+    ReloadConfigIfChanged(true);
+    LoadState();
 
     std::thread updater(UpdateThread);
     std::thread pipeServer(InboundAcceptLoop);
     std::thread outPipe(OutPipeThread);
+    std::thread hotReload(HotReloadThread);
+    std::thread heartbeat(HeartbeatThread);
 
     MSG msg;
     while(GetMessage(&msg, nullptr, 0, 0)) {
@@ -621,6 +761,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     updater.join();
     pipeServer.join();
     outPipe.join();
+    hotReload.join();
+    gHeartbeatRunning=false; heartbeat.join();
     if(gLLHook) { UnhookWindowsHookEx(gLLHook); gLLHook=nullptr; }
     return 0;
 }
