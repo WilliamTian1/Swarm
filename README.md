@@ -39,7 +39,7 @@ Short Term:
 - (DONE) Line-delimited startup config `swarm_config.jsonl`
 - (DONE) Debug modes: windowed / overlay / solid background
 - (DONE) Outbound event pipe (basic)
-- TODO Hotkey to toggle overlay visibility
+- (DONE) Global hotkeys (Ctrl+Alt+D/W/O/F/C/X)
 
 Medium Term:
 - Shared memory ring buffer for high-frequency cursor command stream
@@ -92,6 +92,18 @@ $p.Connect(); $sr = New-Object IO.StreamReader $p; while($true){ $line=$sr.ReadL
 Then send commands inbound similarly (as previously documented).
 
 Startup config file `swarm_config.jsonl`: each non-empty, non-# line is fed through the same command handler at launch.
+
+## Hotkeys
+Global (system-wide) hotkeys registered by the overlay:
+
+Ctrl+Alt+D  Toggle solid debug background transparency
+Ctrl+Alt+W  Toggle windowed <-> overlay mode
+Ctrl+Alt+O  Add an orbit cursor (radius 80)
+Ctrl+Alt+F  Add a follow-lag cursor (lag 400ms)
+Ctrl+Alt+C  Clear all cursors
+Ctrl+Alt+X  Exit overlay
+
+Each hotkey prints a log line in the console. These are convenience controls while iterating.
 
 The AutoHotkey script can `FileOpen("\\\\.\\pipe\\SwarmPipe", "w")` and `FileAppend` JSON lines. To receive events, open `SwarmPipeOut` for reading.
 

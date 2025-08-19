@@ -109,6 +109,7 @@ static std::atomic<bool> gWindowedMode {false};
 static std::mutex gOutPipeMtx;
 static HANDLE gOutPipe = INVALID_HANDLE_VALUE; // outbound event stream
 static std::atomic<bool> gOutPipeReady {false};
+static bool gShowHelp = true; // draw help text overlay in windowed mode for user guidance
 
 void sendOut(const std::string &line) {
     std::lock_guard<std::mutex> lock(gOutPipeMtx);
@@ -212,6 +213,7 @@ void handleCommand(const std::string &line) {
         if(kv.count("x")) c.target.x = (LONG)atof(kv["x"].c_str());
         if(kv.count("y")) c.target.y = (LONG)atof(kv["y"].c_str());
         if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
+    if(kv.count("size")) { int s = atoi(kv["size"].c_str()); if(s>2 && s<400) c.size = s; }
         if(c.behavior==BehaviorType::Static) c.pos = c.target;
         int id = gManager.addCursor(c);
     printf("Added cursor id=%d behavior=%d color=%06lX lagMs=%.1f radius=%.1f\n", id, (int)c.behavior, (unsigned long)c.color, c.lagMs, c.radius);
@@ -241,6 +243,7 @@ void handleCommand(const std::string &line) {
             if(kv.count("y")) c.target.y = (LONG)atof(kv["y"].c_str());
             if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
             if(kv.count("color")) c.color = parseColor(kv["color"]);
+            if(kv.count("size")) { int s = atoi(kv["size"].c_str()); if(s>2 && s<400) c.size = s; }
             printf("Updated cursor id=%d behavior=%d\n", id, (int)c.behavior);
             char buf[160];
             snprintf(buf, sizeof(buf), "{\"event\":\"updated\",\"id\":%d,\"behavior\":%d}\n", id, (int)c.behavior);
@@ -387,6 +390,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SelectObject(hdc, old);
                 DeleteObject(b);
             }
+            if(gShowHelp) {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, RGB(230,230,230));
+                const wchar_t *lines[] = {
+                    L"Swarm Controls (focus window to use)",
+                    L"D : Toggle solid background",
+                    L"W : Toggle windowed/overlay",
+                    L"O : Add orbit cursor",
+                    L"F : Add follow cursor",
+                    L"C : Clear cursors",
+                    L"X : Exit",
+                    L"H : Hide/show this help",
+                    L"Digits 1-6 also trigger same actions",
+                    L"(Global Ctrl+Alt hotkeys may have failed to register)"
+                };
+                int y=10; for(auto *ln: lines){ TextOutW(hdc, 10, y, ln, (int)wcslen(ln)); y+=18; }
+            }
             static int paintCount = 0;
             if(paintCount < 60) {
                 printf("WM_PAINT frame=%d cursors=%zu firstPos=(%ld,%ld)\n", paintCount, copy.size(), copy.empty()?0:copy[0].pos.x, copy.empty()?0:copy[0].pos.y);
@@ -397,6 +417,54 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
+        case WM_HOTKEY: {
+            UINT id = (UINT)wParam;
+            if(id==1) { // toggle solid debug background
+                bool newVal = !gSolidMode.load();
+                gSolidMode = newVal;
+                if(gManager.overlayWnd) {
+                    if(newVal) {
+                        SetLayeredWindowAttributes(gManager.overlayWnd, 0, (BYTE)200, LWA_ALPHA);
+                        printf("Hotkey: solid background ON\n");
+                    } else {
+                        SetLayeredWindowAttributes(gManager.overlayWnd, RGB(0,0,0), 0, LWA_COLORKEY);
+                        printf("Hotkey: solid background OFF\n");
+                    }
+                }
+            } else if(id==2) { // toggle windowed/overlay
+                if(gWindowedMode) SwitchToOverlay(gManager.overlayWnd); else SwitchToWindowed(gManager.overlayWnd);
+            } else if(id==3) { // add orbit cursor
+                SwarmCursor c; c.behavior=BehaviorType::Orbit; c.radius=80; c.speed=1.0; c.color=RGB(255,140,0); c.size=14; gManager.addCursor(c); printf("Hotkey: added orbit cursor\n");
+            } else if(id==4) { // add follow cursor
+                SwarmCursor c; c.behavior=BehaviorType::FollowLag; c.lagMs=400; c.color=RGB(120,160,255); c.size=12; gManager.addCursor(c); printf("Hotkey: added follow cursor\n");
+            } else if(id==5) { // clear
+                {
+                    std::lock_guard<std::mutex> lock(gManager.mtx);
+                    gManager.cursors.clear();
+                }
+                printf("Hotkey: cleared cursors\n");
+            } else if(id==6) { // exit
+                printf("Hotkey: exiting\n");
+                gManager.running=false;
+                if(gManager.overlayWnd) PostMessage(gManager.overlayWnd, WM_CLOSE, 0,0);
+            }
+        } return 0;
+        case WM_KEYDOWN: { // Fallback when global hotkeys fail; use keys directly while window focused
+            int vk = (int)wParam;
+            if(vk=='H') { gShowHelp = !gShowHelp; InvalidateRect(hWnd,nullptr,FALSE); printf("Help %s\n", gShowHelp?"shown":"hidden"); return 0; }
+            auto act=[&](int code){
+                switch(code){
+                    case 'D': case '1': {
+                        bool newVal=!gSolidMode.load(); gSolidMode=newVal; if(gManager.overlayWnd){ if(newVal) SetLayeredWindowAttributes(gManager.overlayWnd,0,(BYTE)200,LWA_ALPHA); else SetLayeredWindowAttributes(gManager.overlayWnd,RGB(0,0,0),0,LWA_COLORKEY);} printf("Key(solid %s)\n",newVal?"ON":"OFF"); } break;
+                    case 'W': case '2': { if(gWindowedMode) SwitchToOverlay(gManager.overlayWnd); else SwitchToWindowed(gManager.overlayWnd); printf("Key(toggle window/overlay)\n"); } break;
+                    case 'O': case '3': { SwarmCursor c; c.behavior=BehaviorType::Orbit; c.radius=80; c.speed=1.0; c.color=RGB(255,140,0); c.size=14; gManager.addCursor(c); printf("Key(orbit added)\n"); } break;
+                    case 'F': case '4': { SwarmCursor c; c.behavior=BehaviorType::FollowLag; c.lagMs=400; c.color=RGB(120,160,255); c.size=12; gManager.addCursor(c); printf("Key(follow added)\n"); } break;
+                    case 'C': case '5': { { std::lock_guard<std::mutex> lock(gManager.mtx); gManager.cursors.clear(); } printf("Key(cleared)\n"); } break;
+                    case 'X': case '6': { printf("Key(exit)\n"); gManager.running=false; if(gManager.overlayWnd) PostMessage(gManager.overlayWnd,WM_CLOSE,0,0); } break;
+                }
+            };
+            act(vk);
+        } return 0;
     }
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
@@ -463,6 +531,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     gManager.overlayWnd = CreateOverlayWindow(hInst);
     if(!gManager.overlayWnd) { printf("Failed to create overlay window.\n"); return 1; }
     printf("Overlay created HWND=%p\n", (void*)gManager.overlayWnd);
+
+    // Force initial visibility: windowed + solid debug background + large static reference cursor.
+    // This helps first-time users who might otherwise not notice transparent overlay.
+    SwitchToWindowed(gManager.overlayWnd);
+    gSolidMode = true;
+    // Large magenta static cursor in middle of window for visibility (id will auto-assign)
+    RECT wr; GetClientRect(gManager.overlayWnd, &wr);
+    SwarmCursor big; big.behavior = BehaviorType::Static; big.target.x = (wr.right-wr.left)/2; big.target.y = (wr.bottom-wr.top)/2; big.pos = big.target; big.size = 100; big.color = RGB(255,0,255); gManager.addCursor(big);
+    printf("Startup debug: windowed+solid mode enabled, large static cursor added. Use hotkeys or pipe debug commands to switch back to overlay.\n");
+
+    // Register global hotkeys bound to thread (no window handle) and also attempt with window handle if first fails
+    int hkOk=0; bool anyFail=false;
+    auto tryReg=[&](int id, char ch){ if(RegisterHotKey(nullptr,id,MOD_CONTROL|MOD_ALT,ch)) { hkOk++; return true;} anyFail=true; return false; };
+    tryReg(1,'D'); tryReg(2,'W'); tryReg(3,'O'); tryReg(4,'F'); tryReg(5,'C'); tryReg(6,'X');
+    if(anyFail && gManager.overlayWnd) {
+        // second attempt with window handle
+        auto tryRegWnd=[&](int id,char ch){ if(RegisterHotKey(gManager.overlayWnd,id,MOD_CONTROL|MOD_ALT,ch)) hkOk++; };
+        tryRegWnd(1,'D'); tryRegWnd(2,'W'); tryRegWnd(3,'O'); tryRegWnd(4,'F'); tryRegWnd(5,'C'); tryRegWnd(6,'X');
+    }
+    if(hkOk>0) printf("Hotkeys registered (%d). Ctrl+Alt+D/W/O/F/C/X and in-window keys + digits active. Press H to hide help.\n", hkOk);
+    else printf("No global hotkeys registered. Use focused window keys (D/W/O/F/C/X or digits 1-6).\n");
+    // Ensure focus so keydown fallback works immediately
+    SetForegroundWindow(gManager.overlayWnd);
+    SetFocus(gManager.overlayWnd);
 
     // Load config file (line-delimited JSON commands) if present
     const char *cfgName = "swarm_config.jsonl";
