@@ -455,9 +455,49 @@ static void CleanupScriptProcess(SwarmCursor &c) {
 
 void handleCommand(const std::string &line) {
     auto kv = parseSimpleJson(line);
-    auto cmdIt = kv.find("cmd"); if(cmdIt==kv.end()) return;
+    // New structured protocol prefers 'op' over legacy 'cmd'
+    auto opIt = kv.find("op");
+    if(opIt!=kv.end()) {
+        std::string op = opIt->second; // e.g. "cursor/add"
+        gApiCommandCount++;
+        // Dispatch new ops
+        if(op=="help") {
+            const char *ops[] = {
+                "cursor/add","cursor/update","cursor/remove","cursor/clear","cursor/list",
+                "mouse/click","mouse/down","mouse/up","mouse/drag",
+                "state/save","state/load","state/reload",
+                "sys/exit","sys/perf","config/setAhk","debug/mode"
+            };
+            for(auto &o: ops) { sendOut(std::string("{\"event\":\"help\",\"op\":\"")+o+"\"}\n"); }
+            sendOut("{\"event\":\"helpDone\"}\n");
+            return;
+        } else if(op=="cursor/add") {
+            kv["cmd"] = "add"; // reuse legacy path
+        } else if(op=="cursor/update") {
+            kv["cmd"] = "set";
+        } else if(op=="cursor/remove") { kv["cmd"] = "remove"; }
+        else if(op=="cursor/clear") { kv["cmd"] = "clear"; }
+        else if(op=="cursor/list") { kv["cmd"] = "list"; }
+        else if(op=="mouse/click") { kv["cmd"] = "clickId"; }
+        else if(op=="mouse/down") { kv["cmd"] = "downId"; }
+        else if(op=="mouse/up") { kv["cmd"] = "upId"; }
+        else if(op=="mouse/drag") { kv["cmd"] = "dragId"; }
+        else if(op=="state/save") { kv["cmd"] = "save"; }
+        else if(op=="state/load") { kv["cmd"] = "load"; }
+        else if(op=="state/reload") { kv["cmd"] = "reload"; }
+        else if(op=="sys/exit") { kv["cmd"] = "exit"; }
+        else if(op=="sys/perf") { kv["cmd"] = "perf"; }
+        else if(op=="config/setAhk") { kv["cmd"] = "setAhk"; }
+        else if(op=="debug/mode") { kv["cmd"] = "debug"; }
+        else if(op=="cursor/tweak") { kv["cmd"] = "tweak"; }
+        else {
+            sendOut(std::string("{\"event\":\"error\",\"msg\":\"unknown op ")+op+"\"}\n");
+            return;
+        }
+    }
+    auto cmdIt = kv.find("cmd"); if(cmdIt==kv.end()) return; // still nothing
     std::string cmd = cmdIt->second;
-    printf("IPC command line: %s\n", line.c_str());
+    printf("IPC command: %s (line=%s)\n", cmd.c_str(), line.c_str());
     gApiCommandCount++;
     if(cmd=="add") {
         SwarmCursor c; c.size=12; c.color=RGB(0,200,255);
@@ -886,7 +926,7 @@ void SaveState() {
     if(!out) { printf("SaveState: failed open %s\n", kStateFile); return; }
     for(auto &c: gManager.cursors) {
         std::string beh = (c.behavior==BehaviorType::Mirror?"mirror":(c.behavior==BehaviorType::Static?"static":(c.behavior==BehaviorType::Orbit?"orbit":(c.behavior==BehaviorType::FollowLag?"follow":"script"))));
-        out << "{\"cmd\":\"add\",\"id\":" << c.id
+        out << "{\"op\":\"cursor/add\",\"id\":" << c.id
             << ",\"behavior\":\"" << beh << "\""
             << ",\"offsetX\":" << c.offsetX << ",\"offsetY\":" << c.offsetY
             << ",\"radius\":" << c.radius << ",\"speed\":" << c.speed

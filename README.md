@@ -94,7 +94,26 @@ Core inbound pipe: `\\.\\pipe\\SwarmPipe`
 Core outbound (events) pipe: `\\.\\pipe\\SwarmPipeOut`
 Per-script inbound (script -> overlay) pipe: `\\.\\pipe\\SwarmScript_<cursorId>` (created when a script cursor is added)
 
-Supported inbound commands (JSON object per line):
+Supported inbound commands (JSON object per line). New structured form uses `op` (legacy `cmd` still accepted):
+```
+{"op":"help"}
+{"op":"cursor/add", "behavior":"orbit", "radius":80, "speed":1.2, "color":"#FF8833"}
+{"op":"cursor/add", "behavior":"script", "script":"C:/path/My.ahk"}
+{"op":"cursor/update", "id":3, "behavior":"follow", "lagMs":500}
+{"op":"cursor/remove", "id":2}
+{"op":"cursor/clear"}
+{"op":"cursor/list"}
+{"op":"mouse/click", "id":5, "button":0}
+{"op":"mouse/drag", "id":5, "tx":800, "ty":600, "button":0}
+{"op":"state/save"}
+{"op":"state/load"}
+{"op":"state/reload"}
+{"op":"sys/perf"}
+{"op":"debug/mode", "mode":"solidOn"}
+{"op":"config/setAhk", "path":"D:/Tools/AutoHotkey64.exe"}
+{"op":"sys/exit"}
+```
+Legacy examples (still work):
 ```
 {"cmd":"add", "behavior":"orbit", "radius":80, "speed":1.2, "color":"#FF8833"}
 {"cmd":"set", "id":3, "behavior":"follow", "lagMs":500}
@@ -102,13 +121,13 @@ Supported inbound commands (JSON object per line):
 {"cmd":"clear"}
 {"cmd":"list"}
 {"cmd":"exit"}
-{"cmd":"debug", "mode":"windowed"}   # or overlay | solidOn | solidOff
+{"cmd":"debug", "mode":"solidOn"}
 {"cmd":"add", "behavior":"static", "x":500, "y":400, "color":"#22DD44"}
 {"cmd":"add", "behavior":"script", "script":"C:/path/to/myscript.ahk"}
 {"cmd":"setAhk", "path":"D:/Tools/AutoHotkey64.exe"}
 ```
 
-Events (lines) emitted on outbound pipe after you connect a reader:
+Events (lines) emitted on outbound pipe after you connect a reader (subset):
 ```
 {"event":"connected"}
 {"event":"added","id":5,"behavior":2}
@@ -123,6 +142,8 @@ Events (lines) emitted on outbound pipe after you connect a reader:
 {"event":"scriptLog","id":7,"msg":"hello from script"}
 {"event":"scriptExit","id":7}
 {"event":"scriptError","id":7,"code":"launchFail"}
+{"event":"help","op":"cursor/add"}
+{"event":"helpDone"}
 ```
 
 Connect outbound pipe first (optional) so you get events immediately; then send inbound commands.
