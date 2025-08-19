@@ -1,0 +1,4 @@
+# Each line is a JSON command executed on startup
+{"cmd":"add","behavior":"mirror","offsetX":0,"offsetY":0,"color":"#FF4444"}
+{"cmd":"add","behavior":"orbit","radius":100,"speed":0.8,"color":"#33AAFF"}
+{"cmd":"add","behavior":"follow","lagMs":400,"color":"#AA55FF"}

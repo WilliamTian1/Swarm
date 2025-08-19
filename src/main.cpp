@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
+#include <filesystem>
 
 /*
  Swarm prototype
@@ -104,6 +106,17 @@ public:
 static SwarmManager gManager;
 static std::atomic<bool> gSolidMode {false};
 static std::atomic<bool> gWindowedMode {false};
+static std::mutex gOutPipeMtx;
+static HANDLE gOutPipe = INVALID_HANDLE_VALUE; // outbound event stream
+static std::atomic<bool> gOutPipeReady {false};
+
+void sendOut(const std::string &line) {
+    std::lock_guard<std::mutex> lock(gOutPipeMtx);
+    if(gOutPipeReady && gOutPipe!=INVALID_HANDLE_VALUE) {
+        std::string data = line; if(data.empty() || data.back()!='\n') data.push_back('\n');
+        DWORD written=0; WriteFile(gOutPipe, data.data(), (DWORD)data.size(), &written, nullptr);
+    }
+}
 
 void SwitchToWindowed(HWND hWnd) {
     if(!hWnd) return;
@@ -201,12 +214,18 @@ void handleCommand(const std::string &line) {
         if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
         if(c.behavior==BehaviorType::Static) c.pos = c.target;
         int id = gManager.addCursor(c);
-        printf("Added cursor id=%d behavior=%d color=%06X lagMs=%.1f radius=%.1f\n", id, (int)c.behavior, c.color, c.lagMs, c.radius);
+    printf("Added cursor id=%d behavior=%d color=%06lX lagMs=%.1f radius=%.1f\n", id, (int)c.behavior, (unsigned long)c.color, c.lagMs, c.radius);
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"event\":\"added\",\"id\":%d,\"behavior\":%d}\n", id, (int)c.behavior);
+        sendOut(buf);
     } else if(cmd=="remove") {
         if(kv.count("id")) {
             int id = atoi(kv["id"].c_str());
             bool ok = gManager.removeCursor(id);
             printf("Remove cursor id=%d result=%s\n", id, ok?"ok":"notfound");
+            char buf[128];
+            snprintf(buf, sizeof(buf), "{\"event\":\"removed\",\"id\":%d,\"ok\":%s}\n", id, ok?"true":"false");
+            sendOut(buf);
         }
     } else if(cmd=="set") {
     if(!kv.count("id")) return; 
@@ -223,6 +242,9 @@ void handleCommand(const std::string &line) {
             if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
             if(kv.count("color")) c.color = parseColor(kv["color"]);
             printf("Updated cursor id=%d behavior=%d\n", id, (int)c.behavior);
+            char buf[160];
+            snprintf(buf, sizeof(buf), "{\"event\":\"updated\",\"id\":%d,\"behavior\":%d}\n", id, (int)c.behavior);
+            sendOut(buf);
         }
     } else if(cmd=="debug") {
         if(kv.count("mode")) {
@@ -246,6 +268,27 @@ void handleCommand(const std::string &line) {
                 SwitchToOverlay(gManager.overlayWnd);
             }
         }
+    } else if(cmd=="clear") {
+        {
+            std::lock_guard<std::mutex> lock(gManager.mtx);
+            gManager.cursors.clear();
+        }
+        printf("All cursors cleared.\n");
+        sendOut("{\"event\":\"cleared\"}\n");
+    } else if(cmd=="list") {
+        std::vector<SwarmCursor> copy; {
+            std::lock_guard<std::mutex> lock(gManager.mtx); copy = gManager.cursors; }
+        for(auto &c : copy) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "{\"event\":\"cursor\",\"id\":%d,\"behavior\":%d,\"x\":%ld,\"y\":%ld}\n", c.id, (int)c.behavior, c.pos.x, c.pos.y);
+            sendOut(buf);
+        }
+        sendOut("{\"event\":\"listDone\"}\n");
+    } else if(cmd=="exit") {
+        printf("Exit command received. Shutting down...\n");
+        sendOut("{\"event\":\"exiting\"}\n");
+        gManager.running = false;
+        if(gManager.overlayWnd) PostMessage(gManager.overlayWnd, WM_CLOSE, 0, 0);
     }
 }
 
@@ -273,6 +316,43 @@ void PipeThread() {
                 }
             }
             if(!buffer.empty()) handleCommand(buffer);
+        }
+        DisconnectNamedPipe(hPipe);
+        CloseHandle(hPipe);
+    }
+}
+
+void OutPipeThread() {
+    const wchar_t *pipeName = L"\\\\.\\pipe\\SwarmPipeOut";
+    while(gManager.running) {
+        HANDLE hPipe = CreateNamedPipeW(
+            pipeName,
+            PIPE_ACCESS_OUTBOUND,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, 4096, 4096, 0, nullptr);
+        if(hPipe==INVALID_HANDLE_VALUE) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+        BOOL connected = ConnectNamedPipe(hPipe, nullptr) ? TRUE : (GetLastError()==ERROR_PIPE_CONNECTED);
+        if(connected) {
+            {
+                std::lock_guard<std::mutex> lock(gOutPipeMtx);
+                gOutPipe = hPipe;
+                gOutPipeReady = true;
+            }
+            sendOut("{\"event\":\"connected\"}\n");
+            // Block until client disconnects or shutdown
+            while(gManager.running) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if(WaitForSingleObject(hPipe, 0)==WAIT_OBJECT_0) break; // unlikely
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(gOutPipeMtx);
+            if(gOutPipe==hPipe) {
+                gOutPipeReady = false; gOutPipe = INVALID_HANDLE_VALUE;
+            }
         }
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
@@ -382,10 +462,27 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     gManager.overlayWnd = CreateOverlayWindow(hInst);
     if(!gManager.overlayWnd) { printf("Failed to create overlay window.\n"); return 1; }
-    printf("Overlay created HWND=%p\n", gManager.overlayWnd);
+    printf("Overlay created HWND=%p\n", (void*)gManager.overlayWnd);
+
+    // Load config file (line-delimited JSON commands) if present
+    const char *cfgName = "swarm_config.jsonl";
+    if(std::filesystem::exists(cfgName)) {
+        std::ifstream in(cfgName, std::ios::in);
+        if(in) {
+            std::string line; int count=0;
+            while(std::getline(in, line)) {
+                if(line.empty()) continue;
+                if(line[0]=='#') continue;
+                handleCommand(line);
+                count++;
+            }
+            printf("Loaded %d config lines from %s\n", count, cfgName);
+        }
+    }
 
     std::thread updater(UpdateThread);
     std::thread pipeServer(PipeThread);
+    std::thread outPipe(OutPipeThread);
 
     MSG msg;
     while(GetMessage(&msg, nullptr, 0, 0)) {
@@ -396,6 +493,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     gManager.running = false;
     updater.join();
     pipeServer.join();
+    outPipe.join();
     return 0;
 }
 

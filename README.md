@@ -34,10 +34,12 @@ Exit by closing via Task Manager or adding an exit feature (planned). Currently 
 
 ## Roadmap
 Short Term:
-- IPC channel (WM_COPYDATA or Named Pipe) for AHK -> core commands
-- Add behaviors: stationary, orbit, follow with delay, scripted path
-- Configuration file (JSON / simple INI) for number/colors/behaviors
-- Hotkey to toggle overlay visibility
+- (DONE) Named Pipe IPC inbound commands
+- (DONE) Behaviors: mirror, orbit, follow (lag), static
+- (DONE) Line-delimited startup config `swarm_config.jsonl`
+- (DONE) Debug modes: windowed / overlay / solid background
+- (DONE) Outbound event pipe (basic)
+- TODO Hotkey to toggle overlay visibility
 
 Medium Term:
 - Shared memory ring buffer for high-frequency cursor command stream
@@ -52,13 +54,46 @@ Long Term / Stretch:
 - Installer & signed driver (if ever needed for deeper integration)
 
 ## IPC Design Sketch
-Initial approach: Named Pipe `\\.\\pipe\\SwarmPipe` with simple JSON messages, e.g.:
+Inbound pipe: `\\.\\pipe\\SwarmPipe`
+Outbound (events) pipe: `\\.\\pipe\\SwarmPipeOut`
+
+Supported inbound commands (JSON object per line):
 ```
-{"cmd":"add","behavior":"orbit","radius":40,"color":"#33FFAA"}
-{"cmd":"remove","id":3}
-{"cmd":"set","id":2,"behavior":"follow","lagMs":120}
+{"cmd":"add", "behavior":"orbit", "radius":80, "speed":1.2, "color":"#FF8833"}
+{"cmd":"set", "id":3, "behavior":"follow", "lagMs":500}
+{"cmd":"remove", "id":2}
+{"cmd":"clear"}
+{"cmd":"list"}
+{"cmd":"exit"}
+{"cmd":"debug", "mode":"windowed"}   # or overlay | solidOn | solidOff
+{"cmd":"add", "behavior":"static", "x":500, "y":400, "color":"#22DD44"}
 ```
-The AutoHotkey script can `FileOpen("\\\\.\\pipe\\SwarmPipe", "w")` and `FileAppend` JSON lines.
+
+Events (lines) emitted on outbound pipe after you connect a reader:
+```
+{"event":"connected"}
+{"event":"added","id":5,"behavior":2}
+{"event":"updated","id":5,"behavior":1}
+{"event":"removed","id":5,"ok":true}
+{"event":"cleared"}
+{"event":"cursor","id":1,"behavior":0,"x":123,"y":456}   # for each on list
+{"event":"listDone"}
+{"event":"exiting"}
+```
+
+Connect outbound pipe first (optional) so you get events immediately; then send inbound commands.
+
+Example (PowerShell outbound read):
+```
+$p = New-Object IO.Pipes.NamedPipeClientStream '.' 'SwarmPipeOut' ([IO.Pipes.PipeDirection]::In)
+$p.Connect(); $sr = New-Object IO.StreamReader $p; while($true){ $line=$sr.ReadLine(); if($line -eq $null){break}; Write-Host $line }
+```
+
+Then send commands inbound similarly (as previously documented).
+
+Startup config file `swarm_config.jsonl`: each non-empty, non-# line is fed through the same command handler at launch.
+
+The AutoHotkey script can `FileOpen("\\\\.\\pipe\\SwarmPipe", "w")` and `FileAppend` JSON lines. To receive events, open `SwarmPipeOut` for reading.
 
 ## License
 TBD (choose MIT/Apache-2.0 recommended for openness).
