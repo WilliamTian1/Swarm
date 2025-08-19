@@ -1,0 +1,58 @@
+# Build directories
+/build/
+/build-*/
+/out/
+/bin/
+/obj/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+install_manifest.txt
+Testing/
+CTestTestfile.cmake
+
+# Executables and libraries
+/*.exe
+/*.dll
+/*.pdb
+/*.lib
+/*.obj
+*.exe
+*.dll
+*.pdb
+*.obj
+
+# Logs and profiling
+*.log
+*.trace
+*.perf
+
+# Temporary / editor
+*.swp
+*.tmp
+*.bak
+*.old
+.DS_Store
+Thumbs.db
+
+# VSCode settings (optional keep if you add project-specific config)
+.vscode/
+
+# AutoHotkey compiled scripts
+*.ahk.bin
+
+# Crash dumps
+*.dmp
+
+# User local config
+local.config.json
+
+# Python virtualenvs (if added later) 
+.venv/
+venv/
+
+# Node modules (future tooling)
+node_modules/
