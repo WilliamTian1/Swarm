@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <commdlg.h> // for file dialogs
 #include <map>
 #include <cctype>
 #include <sstream>
@@ -28,7 +29,7 @@
  - Future: independent scripted behaviors, AHK integration via IPC or shared memory
 */
 
-enum class BehaviorType { Mirror, Static, Orbit, FollowLag };
+enum class BehaviorType { Mirror, Static, Orbit, FollowLag, Script };
 
 struct SwarmCursor {
     int id {0};
@@ -46,6 +47,10 @@ struct SwarmCursor {
     double lagMs {120};
     // For FollowLag EMA
     bool initialized {false};
+    // Script integration
+    std::string scriptPath;              // .ahk path when behavior==Script
+    PROCESS_INFORMATION scriptPi{0};
+    bool scriptProcessRunning {false};
 };
 
 class SwarmManager {
@@ -203,6 +208,51 @@ static void ExecuteHotChar(char ch) {
         case 'X': {
             printf("Hotkey: exiting (via %c)\n", ch); gManager.running=false; if(gManager.overlayWnd) PostMessage(gManager.overlayWnd, WM_CLOSE, 0,0);
         } break;
+        case 'S': {
+            // Shift+Alt+S => create new script template; else pick existing
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000)!=0;
+            if(shift) {
+                // Save dialog to create new script
+                wchar_t fileBuf[512] = L"";
+                OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = gManager.overlayWnd;
+                ofn.lpstrFilter = L"AutoHotkey Script (*.ahk)\0*.ahk\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = fileBuf; ofn.nMaxFile = 512;
+                ofn.lpstrDefExt = L"ahk";
+                ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+                if(GetSaveFileNameW(&ofn)) {
+                    std::wstring ws(fileBuf); std::string path(ws.begin(), ws.end());
+                    // Write template
+                    std::ofstream out(path, std::ios::out|std::ios::trunc);
+                    if(out) {
+                        out << "; Swarm cursor script template\n";
+                        out << "; Arg1 (if provided) = cursor id\n";
+                        out << "#NoTrayIcon\n";
+                        out << "#SingleInstance Force\n";
+                        out << "; Example: simple loop (adjust later to send IPC)\n";
+                        out << "Sleep, 1000\n";
+                    }
+                    // Launch notepad for editing
+                    std::string cmd = "notepad \"" + path + "\"";
+                    system(cmd.c_str());
+                    // Add script cursor (will launch AHK when added via command)
+                    std::string json = std::string("{\"cmd\":\"add\",\"behavior\":\"script\",\"script\":\"") + path + "\"}";
+                    handleCommand(json);
+                }
+            } else {
+                wchar_t fileBuf[512] = L"";
+                OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = gManager.overlayWnd;
+                ofn.lpstrFilter = L"AutoHotkey Script (*.ahk)\0*.ahk\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = fileBuf; ofn.nMaxFile = 512;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if(GetOpenFileNameW(&ofn)) {
+                    std::wstring ws(fileBuf); std::string path(ws.begin(), ws.end());
+                    std::string json = std::string("{\"cmd\":\"add\",\"behavior\":\"script\",\"script\":\"") + path + "\"}";
+                    handleCommand(json);
+                }
+            }
+        } break;
     }
 }
 
@@ -213,7 +263,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wParam, LPARAM lPa
             bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000)!=0; // either Alt key
             if(altDown) {
                 switch(k->vkCode) {
-                    case 'D': case 'O': case 'F': case 'C': case 'X':
+                    case 'D': case 'O': case 'F': case 'C': case 'X': case 'S':
                         ExecuteHotChar((char)k->vkCode);
                         return 1; // swallow so plain key not delivered
                 }
@@ -271,7 +321,32 @@ static BehaviorType parseBehavior(const std::string &b) {
     if(b=="static") return BehaviorType::Static;
     if(b=="orbit") return BehaviorType::Orbit;
     if(b=="follow"||b=="followlag") return BehaviorType::FollowLag;
+    if(b=="script") return BehaviorType::Script;
     return BehaviorType::Mirror;
+}
+
+static const char* kAhkExe = "AutoHotkey64.exe"; // assumes in PATH
+
+static bool LaunchScriptProcess(SwarmCursor &c) {
+    if(c.scriptPath.empty()) return false;
+    std::string cmd = std::string(kAhkExe) + " \"" + c.scriptPath + "\" " + std::to_string(c.id);
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr,nullptr,FALSE, CREATE_NO_WINDOW, nullptr,nullptr,&si,&pi);
+    if(!ok) { printf("Script launch failed id=%d gle=%lu path=%s\n", c.id, GetLastError(), c.scriptPath.c_str()); return false; }
+    c.scriptPi = pi; c.scriptProcessRunning=true; printf("Script launched id=%d pid=%lu path=%s\n", c.id, pi.dwProcessId, c.scriptPath.c_str()); return true;
+}
+
+static void CleanupScriptProcess(SwarmCursor &c) {
+    if(!c.scriptProcessRunning) return;
+    DWORD res = WaitForSingleObject(c.scriptPi.hProcess, 0);
+    if(res!=WAIT_OBJECT_0) {
+        TerminateProcess(c.scriptPi.hProcess, 0);
+        WaitForSingleObject(c.scriptPi.hProcess, 500);
+    }
+    CloseHandle(c.scriptPi.hThread);
+    CloseHandle(c.scriptPi.hProcess);
+    c.scriptProcessRunning=false;
 }
 
 void handleCommand(const std::string &line) {
@@ -291,17 +366,27 @@ void handleCommand(const std::string &line) {
         if(kv.count("x")) c.target.x = (LONG)atof(kv["x"].c_str());
         if(kv.count("y")) c.target.y = (LONG)atof(kv["y"].c_str());
         if(kv.count("lagMs")) c.lagMs = atof(kv["lagMs"].c_str());
-    if(kv.count("size")) { int s = atoi(kv["size"].c_str()); if(s>2 && s<400) c.size = s; }
+	if(kv.count("size")) { int s = atoi(kv["size"].c_str()); if(s>2 && s<400) c.size = s; }
+        if(kv.count("script")) c.scriptPath = kv["script"];
         if(c.behavior==BehaviorType::Static) c.pos = c.target;
         int id = gManager.addCursor(c);
-    printf("Added cursor id=%d behavior=%d color=%06lX lagMs=%.1f radius=%.1f\n", id, (int)c.behavior, (unsigned long)c.color, c.lagMs, c.radius);
+	printf("Added cursor id=%d behavior=%d color=%06lX lagMs=%.1f radius=%.1f script=%s\n", id, (int)c.behavior, (unsigned long)c.color, c.lagMs, c.radius, c.scriptPath.c_str());
+        if(c.behavior==BehaviorType::Script) {
+            // launch process for this cursor
+            std::lock_guard<std::mutex> lock(gManager.mtx);
+            for(auto &rc : gManager.cursors) if(rc.id==id) LaunchScriptProcess(rc);
+        }
         char buf[256];
         snprintf(buf, sizeof(buf), "{\"event\":\"added\",\"id\":%d,\"behavior\":%d}\n", id, (int)c.behavior);
         sendOut(buf);
     } else if(cmd=="remove") {
         if(kv.count("id")) {
             int id = atoi(kv["id"].c_str());
-            bool ok = gManager.removeCursor(id);
+            bool ok=false; {
+                std::lock_guard<std::mutex> lock(gManager.mtx);
+                for(auto &c : gManager.cursors) if(c.id==id && c.behavior==BehaviorType::Script) CleanupScriptProcess(c);
+                ok = gManager.removeCursor(id);
+            }
             printf("Remove cursor id=%d result=%s\n", id, ok?"ok":"notfound");
             char buf[128];
             snprintf(buf, sizeof(buf), "{\"event\":\"removed\",\"id\":%d,\"ok\":%s}\n", id, ok?"true":"false");
@@ -366,6 +451,7 @@ void handleCommand(const std::string &line) {
     } else if(cmd=="clear") {
         {
             std::lock_guard<std::mutex> lock(gManager.mtx);
+            for(auto &c : gManager.cursors) if(c.behavior==BehaviorType::Script) CleanupScriptProcess(c);
             gManager.cursors.clear();
         }
         printf("All cursors cleared.\n");
@@ -559,6 +645,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     L"Alt+O add orbit cursor",
                     L"Alt+F add follow cursor",
                     L"Alt+C clear cursors",
+                    L"Alt+S add script cursor (Shift=New)",
                     L"Alt+X exit",
                     L"H (focus) toggle help",
                     L"Always full-screen transparent overlay"
@@ -577,7 +664,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case WM_HOTKEY: {
             UINT id = (UINT)wParam; char ch=0;
-            if(id==1) ch='D'; else if(id==3) ch='O'; else if(id==4) ch='F'; else if(id==5) ch='C'; else if(id==6) ch='X';
+            if(id==1) ch='D'; else if(id==3) ch='O'; else if(id==4) ch='F'; else if(id==5) ch='C'; else if(id==6) ch='X'; else if(id==7) ch='S';
             if(ch) ExecuteHotChar(ch);
         } return 0;
     case WM_KEYDOWN: { int vk=(int)wParam; if(vk=='H'){ gShowHelp=!gShowHelp; InvalidateRect(hWnd,nullptr,FALSE); printf("Help %s\n", gShowHelp?"shown":"hidden"); } return 0; }
@@ -738,16 +825,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Register global hotkeys and also set a low-level hook so Alt combos keep working after focus changes
     int hkOk=0; bool anyFail=false;
     auto tryAlt=[&](int id,char ch){ if(RegisterHotKey(nullptr,id,MOD_ALT,ch)) { hkOk++; return true;} anyFail=true; return false; };
-    tryAlt(1,'D'); tryAlt(3,'O'); tryAlt(4,'F'); tryAlt(5,'C'); tryAlt(6,'X');
+    tryAlt(1,'D'); tryAlt(3,'O'); tryAlt(4,'F'); tryAlt(5,'C'); tryAlt(6,'X'); tryAlt(7,'S');
     if(anyFail && gManager.overlayWnd) {
         auto tryAltWnd=[&](int id,char ch){ if(RegisterHotKey(gManager.overlayWnd,id,MOD_ALT,ch)) hkOk++; };
         tryAltWnd(1,'D'); tryAltWnd(3,'O'); tryAltWnd(4,'F'); tryAltWnd(5,'C'); tryAltWnd(6,'X');
     }
-    if(hkOk>0) printf("Hotkeys registered (%d). Alt+D/O/F/C/X. H (focus) toggles help.\n", hkOk);
+    if(hkOk>0) printf("Hotkeys registered (%d). Alt+D/O/F/C/S/X (Shift+S new script). H toggles help.\n", hkOk);
     else printf("RegisterHotKey failed for all Alt combos, falling back to hook only.\n");
 
     gLLHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);
-    if(gLLHook) printf("Low-level keyboard hook installed for Alt+D/O/F/C/X.\n");
+    if(gLLHook) printf("Low-level keyboard hook installed for Alt+D/O/F/C/S/X.\n");
     else printf("Failed to install low-level keyboard hook (gle=%lu).\n", GetLastError());
     // Do NOT force focus; user can Alt+Tab freely. (Focus only needed for fallback keys in windowed mode.)
 

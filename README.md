@@ -2,6 +2,13 @@
 
 Experimental Windows "multi-cursor" overlay system. Provides a transparent, click-through, always-on-top layered window that renders additional virtual cursors which can mirror the real mouse, remain static, or follow scripted behaviors.
 
+## Resume-Style Highlights
+- High-FPS (~60) transparent multi-cursor overlay (Win32 layered + custom polygon renderer)
+- 25+ command automation bridge (add/remove/set/tweak/mouse/perf/save/load/reload/list/clear/...)
+- Low-latency global input (Alt hotkeys + WH_KEYBOARD_LL hook)
+- Hot-reload & persistence (config + state replay)
+- Self-healing watchdog (heartbeat + auto-restart <2s typical downtime)
+
 ## Current Prototype
 Implemented in C++ (`src/main.cpp`):
 - Layered, transparent, full-screen overlay window (no taskbar icon)
@@ -52,6 +59,34 @@ Long Term / Stretch:
 - Recording & playback of cursor motion sets
 - Plugin interface for custom behavior modules
 - Installer & signed driver (if ever needed for deeper integration)
+
+## Watchdog (High Availability)
+Lightweight supervisor (`src/watchdog.cpp`) keeps the overlay alive.
+
+Build (MSVC single-file):
+```
+cl /nologo /std:c++17 /O2 /EHsc src\watchdog.cpp /Fe:swarm_watchdog.exe /link user32.lib
+```
+
+Run:
+```
+./swarm_watchdog.exe --exe swarm.exe --heartbeat swarm_heartbeat.txt --interval 1000 --staleMs 5000
+```
+
+Stop gracefully (create sentinel; overlay continues running):
+```
+echo stop > swarm_watchdog.stop
+```
+
+Tune thresholds:
+```
+./swarm_watchdog.exe --staleMs 3000 --interval 750 --retries 2
+```
+
+Notes:
+- Heartbeat file written once per second by overlay (first line = epoch ms).
+- After N (retries) consecutive stale detections, overlay is terminated then relaunched.
+- Simple polling design; could evolve to file change notifications, Windows service, or job object supervision.
 
 ## IPC Design Sketch
 Inbound pipe: `\\.\\pipe\\SwarmPipe`
