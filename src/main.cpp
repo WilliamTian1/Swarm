@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <atomic>
 #include <chrono>
+#include <unordered_map>
 
 /*
  Swarm prototype
@@ -162,6 +163,101 @@ static const char* kStateFile = "swarm_state.jsonl";
 static const char* kConfigFile = "swarm_config.jsonl";
 static const char* kHeartbeatFile = "swarm_heartbeat.txt";
 static std::atomic<int> gApiCommandCount {0};
+static std::string gAhkExePath = "AutoHotkey64.exe"; // configurable via setAhk command
+
+// Forward declaration because script pipe reader feeds commands back
+void handleCommand(const std::string &line);
+
+// ---------------- Script per-cursor inbound pipe (script -> overlay) ---------------
+struct ScriptPipeInfo {
+    int id{0};
+    std::wstring pipeNameW; // \\.\pipe\SwarmScript_<id>
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    std::atomic<bool> running{true};
+    std::thread th;
+};
+static std::mutex gScriptPipeMtx;
+static std::unordered_map<int,std::unique_ptr<ScriptPipeInfo>> gScriptPipes; // by cursor id
+
+static std::wstring MakeScriptPipeNameW(int id) {
+    wchar_t buf[128]; swprintf(buf,128,L"\\\\.\\pipe\\SwarmScript_%d", id); return buf;
+}
+
+static void StopScriptPipe(int id) {
+    std::unique_ptr<ScriptPipeInfo> owned;
+    {
+        std::lock_guard<std::mutex> lk(gScriptPipeMtx);
+        auto it = gScriptPipes.find(id);
+        if(it!=gScriptPipes.end()) { owned = std::move(it->second); gScriptPipes.erase(it); }
+    }
+    if(!owned) return;
+    owned->running=false;
+    if(owned->pipe!=INVALID_HANDLE_VALUE) {
+        CancelIoEx(owned->pipe,nullptr);
+        DisconnectNamedPipe(owned->pipe);
+        CloseHandle(owned->pipe);
+    }
+    if(owned->th.joinable()) owned->th.detach();
+}
+
+static void ScriptPipeReader(int id, ScriptPipeInfo *spi) {
+    BOOL connected = ConnectNamedPipe(spi->pipe,nullptr) ? TRUE : (GetLastError()==ERROR_PIPE_CONNECTED);
+    if(!connected) {
+        sendOut(std::string("{\"event\":\"scriptError\",\"id\":")+std::to_string(id)+",\"code\":\"connect\"}\n");
+        return;
+    }
+    sendOut(std::string("{\"event\":\"scriptPipeConnected\",\"id\":")+std::to_string(id)+"}\n");
+    std::string buf; buf.reserve(256);
+    char chunk[128]; DWORD r=0;
+    while(spi->running && ReadFile(spi->pipe, chunk, sizeof(chunk), &r, nullptr)) {
+        if(r==0) break;
+        for(DWORD i=0;i<r;i++) {
+            char c = chunk[i];
+            if(c=='\n' || c=='\r') {
+                if(!buf.empty()) {
+                    std::string line = buf; buf.clear();
+                    std::istringstream iss(line); std::string cmd; iss>>cmd;
+                    if(cmd=="pos") {
+                        double x,y; if(iss>>x>>y) {
+                            std::lock_guard<std::mutex> lk(gManager.mtx);
+                            for(auto &c2: gManager.cursors) if(c2.id==id) { c2.pos.x=(LONG)x; c2.pos.y=(LONG)y; c2.target=c2.pos; }
+                        }
+                    } else if(cmd=="color") {
+                        std::string col; if(iss>>col && col.size()==7 && col[0]=='#') {
+                            auto hx=[&](char ch){ if(ch>='0'&&ch<='9') return ch-'0'; if(ch>='a'&&ch<='f') return 10+ch-'a'; if(ch>='A'&&ch<='F') return 10+ch-'A'; return 0; };
+                            int r2=hx(col[1])*16+hx(col[2]); int g2=hx(col[3])*16+hx(col[4]); int b2=hx(col[5])*16+hx(col[6]);
+                            std::lock_guard<std::mutex> lk(gManager.mtx);
+                            for(auto &c2: gManager.cursors) if(c2.id==id) c2.color=RGB(r2,g2,b2);
+                        }
+                    } else if(cmd=="remove") {
+                        StopScriptPipe(id);
+                        std::string rm = std::string("{\"cmd\":\"remove\",\"id\":")+std::to_string(id)+"}";
+                        handleCommand(rm);
+                    } else if(cmd=="log") {
+                        std::string rest; std::getline(iss,rest); if(!rest.empty() && rest[0]==' ') rest.erase(0,1);
+                        sendOut(std::string("{\"event\":\"scriptLog\",\"id\":")+std::to_string(id)+",\"msg\":\""+rest+"\"}\n");
+                    }
+                }
+            } else if(buf.size()<1024) buf.push_back(c);
+        }
+    }
+    sendOut(std::string("{\"event\":\"scriptExit\",\"id\":")+std::to_string(id)+"}\n");
+}
+
+static void StartScriptPipe(int id) {
+    auto spi = std::make_unique<ScriptPipeInfo>(); spi->id=id; spi->pipeNameW = MakeScriptPipeNameW(id);
+    spi->pipe = CreateNamedPipeW(spi->pipeNameW.c_str(), PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT, 1, 512,512,0,nullptr);
+    if(spi->pipe==INVALID_HANDLE_VALUE) {
+        sendOut(std::string("{\"event\":\"scriptError\",\"id\":")+std::to_string(id)+",\"code\":\"createPipe\"}\n");
+        return;
+    }
+    ScriptPipeInfo *raw = spi.get();
+    spi->th = std::thread([id,raw]{ ScriptPipeReader(id, raw); });
+    {
+        std::lock_guard<std::mutex> lk(gScriptPipeMtx);
+        gScriptPipes[id] = std::move(spi);
+    }
+}
 
 // Forward declarations for new helpers
 void SaveState();
@@ -325,16 +421,24 @@ static BehaviorType parseBehavior(const std::string &b) {
     return BehaviorType::Mirror;
 }
 
-static const char* kAhkExe = "AutoHotkey64.exe"; // assumes in PATH
-
 static bool LaunchScriptProcess(SwarmCursor &c) {
     if(c.scriptPath.empty()) return false;
-    std::string cmd = std::string(kAhkExe) + " \"" + c.scriptPath + "\" " + std::to_string(c.id);
+    StartScriptPipe(c.id);
+    std::wstring pipeW = MakeScriptPipeNameW(c.id);
+    std::string pipeName(pipeW.begin(), pipeW.end());
+    std::string cmd = gAhkExePath + " \"" + c.scriptPath + "\" " + std::to_string(c.id) + " " + pipeName;
     STARTUPINFOA si{}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr,nullptr,FALSE, CREATE_NO_WINDOW, nullptr,nullptr,&si,&pi);
-    if(!ok) { printf("Script launch failed id=%d gle=%lu path=%s\n", c.id, GetLastError(), c.scriptPath.c_str()); return false; }
-    c.scriptPi = pi; c.scriptProcessRunning=true; printf("Script launched id=%d pid=%lu path=%s\n", c.id, pi.dwProcessId, c.scriptPath.c_str()); return true;
+    if(!ok) {
+        printf("Script launch failed id=%d gle=%lu path=%s\n", c.id, GetLastError(), c.scriptPath.c_str());
+        sendOut(std::string("{\"event\":\"scriptError\",\"id\":")+std::to_string(c.id)+",\"code\":\"launchFail\"}\n");
+        return false;
+    }
+    c.scriptPi = pi; c.scriptProcessRunning=true;
+    printf("Script launched id=%d pid=%lu path=%s pipe=%s\n", c.id, pi.dwProcessId, c.scriptPath.c_str(), pipeName.c_str());
+    sendOut(std::string("{\"event\":\"scriptLaunched\",\"id\":")+std::to_string(c.id)+"}\n");
+    return true;
 }
 
 static void CleanupScriptProcess(SwarmCursor &c) {
@@ -357,6 +461,7 @@ void handleCommand(const std::string &line) {
     gApiCommandCount++;
     if(cmd=="add") {
         SwarmCursor c; c.size=12; c.color=RGB(0,200,255);
+        if(kv.count("id")) { c.id = atoi(kv["id"].c_str()); if(c.id>=gManager.nextId.load()) gManager.nextId = c.id+1; }
         if(kv.count("color")) c.color = parseColor(kv["color"]);
         if(kv.count("behavior")) c.behavior = parseBehavior(kv["behavior"]);
         if(kv.count("offsetX")) c.offsetX = atof(kv["offsetX"].c_str());
@@ -379,12 +484,15 @@ void handleCommand(const std::string &line) {
         char buf[256];
         snprintf(buf, sizeof(buf), "{\"event\":\"added\",\"id\":%d,\"behavior\":%d}\n", id, (int)c.behavior);
         sendOut(buf);
+    } else if(cmd=="setAhk") {
+        if(kv.count("path")) { gAhkExePath = kv["path"]; printf("Set AHK path: %s\n", gAhkExePath.c_str()); sendOut(std::string("{\"event\":\"ahkPath\",\"path\":\"")+gAhkExePath+"\"}\n"); }
     } else if(cmd=="remove") {
         if(kv.count("id")) {
             int id = atoi(kv["id"].c_str());
             bool ok=false; {
                 std::lock_guard<std::mutex> lock(gManager.mtx);
                 for(auto &c : gManager.cursors) if(c.id==id && c.behavior==BehaviorType::Script) CleanupScriptProcess(c);
+                StopScriptPipe(id);
                 ok = gManager.removeCursor(id);
             }
             printf("Remove cursor id=%d result=%s\n", id, ok?"ok":"notfound");
@@ -451,7 +559,7 @@ void handleCommand(const std::string &line) {
     } else if(cmd=="clear") {
         {
             std::lock_guard<std::mutex> lock(gManager.mtx);
-            for(auto &c : gManager.cursors) if(c.behavior==BehaviorType::Script) CleanupScriptProcess(c);
+            for(auto &c : gManager.cursors) if(c.behavior==BehaviorType::Script) { CleanupScriptProcess(c); StopScriptPipe(c.id);}            
             gManager.cursors.clear();
         }
         printf("All cursors cleared.\n");
@@ -777,13 +885,15 @@ void SaveState() {
     std::ofstream out(kStateFile, std::ios::out|std::ios::trunc);
     if(!out) { printf("SaveState: failed open %s\n", kStateFile); return; }
     for(auto &c: gManager.cursors) {
+        std::string beh = (c.behavior==BehaviorType::Mirror?"mirror":(c.behavior==BehaviorType::Static?"static":(c.behavior==BehaviorType::Orbit?"orbit":(c.behavior==BehaviorType::FollowLag?"follow":"script"))));
         out << "{\"cmd\":\"add\",\"id\":" << c.id
-            << ",\"behavior\":\"" << (c.behavior==BehaviorType::Mirror?"mirror":(c.behavior==BehaviorType::Static?"static":(c.behavior==BehaviorType::Orbit?"orbit":"follow"))) << "\""
+            << ",\"behavior\":\"" << beh << "\""
             << ",\"offsetX\":" << c.offsetX << ",\"offsetY\":" << c.offsetY
             << ",\"radius\":" << c.radius << ",\"speed\":" << c.speed
             << ",\"lagMs\":" << c.lagMs << ",\"x\":" << c.target.x << ",\"y\":" << c.target.y
-            << ",\"size\":" << c.size
-            << "}\n";
+            << ",\"size\":" << c.size;
+        if(c.behavior==BehaviorType::Script && !c.scriptPath.empty()) out << ",\"script\":\"" << c.scriptPath << "\"";
+        out << "}\n";
     }
     printf("State saved (%zu cursors) to %s\n", gManager.cursors.size(), kStateFile);
 }
@@ -794,6 +904,11 @@ void LoadState() {
     if(!in) return;
     printf("Loading state from %s\n", kStateFile);
     std::string line; while(std::getline(in,line)) { if(line.empty()|| line[0]=='#') continue; handleCommand(line); }
+    // Relaunch scripts (handleCommand already launches; this is defensive if future changes skip)
+    {
+        std::lock_guard<std::mutex> lock(gManager.mtx);
+        for(auto &c : gManager.cursors) if(c.behavior==BehaviorType::Script && !c.scriptProcessRunning) LaunchScriptProcess(c);
+    }
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
@@ -830,7 +945,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         auto tryAltWnd=[&](int id,char ch){ if(RegisterHotKey(gManager.overlayWnd,id,MOD_ALT,ch)) hkOk++; };
         tryAltWnd(1,'D'); tryAltWnd(3,'O'); tryAltWnd(4,'F'); tryAltWnd(5,'C'); tryAltWnd(6,'X');
     }
-    if(hkOk>0) printf("Hotkeys registered (%d). Alt+D/O/F/C/S/X (Shift+S new script). H toggles help.\n", hkOk);
+    if(hkOk>0) printf("Hotkeys registered (%d). Alt+D/O/F/C/S/X (Shift+S new script). H toggles help. AHK=%s\n", hkOk, gAhkExePath.c_str());
     else printf("RegisterHotKey failed for all Alt combos, falling back to hook only.\n");
 
     gLLHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, nullptr, 0);

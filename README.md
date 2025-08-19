@@ -5,8 +5,9 @@ Experimental Windows "multi-cursor" overlay system. Provides a transparent, clic
 ## Resume-Style Highlights
 - High-FPS (~60) transparent multi-cursor overlay (Win32 layered + custom polygon renderer)
 - 25+ command automation bridge (add/remove/set/tweak/mouse/perf/save/load/reload/list/clear/...)
+- Per-cursor scripting (AutoHotkey) with process lifecycle + dedicated pipe (position/color/log back to overlay)
 - Low-latency global input (Alt hotkeys + WH_KEYBOARD_LL hook)
-- Hot-reload & persistence (config + state replay)
+- Hot-reload & persistence (config + state replay incl. script cursors)
 - Self-healing watchdog (heartbeat + auto-restart <2s typical downtime)
 
 ## Current Prototype
@@ -89,8 +90,9 @@ Notes:
 - Simple polling design; could evolve to file change notifications, Windows service, or job object supervision.
 
 ## IPC Design Sketch
-Inbound pipe: `\\.\\pipe\\SwarmPipe`
-Outbound (events) pipe: `\\.\\pipe\\SwarmPipeOut`
+Core inbound pipe: `\\.\\pipe\\SwarmPipe`
+Core outbound (events) pipe: `\\.\\pipe\\SwarmPipeOut`
+Per-script inbound (script -> overlay) pipe: `\\.\\pipe\\SwarmScript_<cursorId>` (created when a script cursor is added)
 
 Supported inbound commands (JSON object per line):
 ```
@@ -102,6 +104,8 @@ Supported inbound commands (JSON object per line):
 {"cmd":"exit"}
 {"cmd":"debug", "mode":"windowed"}   # or overlay | solidOn | solidOff
 {"cmd":"add", "behavior":"static", "x":500, "y":400, "color":"#22DD44"}
+{"cmd":"add", "behavior":"script", "script":"C:/path/to/myscript.ahk"}
+{"cmd":"setAhk", "path":"D:/Tools/AutoHotkey64.exe"}
 ```
 
 Events (lines) emitted on outbound pipe after you connect a reader:
@@ -114,6 +118,11 @@ Events (lines) emitted on outbound pipe after you connect a reader:
 {"event":"cursor","id":1,"behavior":0,"x":123,"y":456}   # for each on list
 {"event":"listDone"}
 {"event":"exiting"}
+{"event":"scriptLaunched","id":7}
+{"event":"scriptPipeConnected","id":7}
+{"event":"scriptLog","id":7,"msg":"hello from script"}
+{"event":"scriptExit","id":7}
+{"event":"scriptError","id":7,"code":"launchFail"}
 ```
 
 Connect outbound pipe first (optional) so you get events immediately; then send inbound commands.
@@ -129,18 +138,52 @@ Then send commands inbound similarly (as previously documented).
 Startup config file `swarm_config.jsonl`: each non-empty, non-# line is fed through the same command handler at launch.
 
 ## Hotkeys
-Global (system-wide) hotkeys registered by the overlay:
+Global (system-wide) hotkeys registered by the overlay (Alt based):
 
-Ctrl+Alt+D  Toggle solid debug background transparency
-Ctrl+Alt+W  Toggle windowed <-> overlay mode
-Ctrl+Alt+O  Add an orbit cursor (radius 80)
-Ctrl+Alt+F  Add a follow-lag cursor (lag 400ms)
-Ctrl+Alt+C  Clear all cursors
-Ctrl+Alt+X  Exit overlay
+Alt+D  Toggle solid debug background transparency
+Alt+O  Add an orbit cursor (radius 80)
+Alt+F  Add a follow-lag cursor (lag 400ms)
+Alt+C  Clear all cursors
+Alt+S  Add a script cursor (Shift+Alt+S = create new script template)
+Alt+X  Exit overlay
 
 Each hotkey prints a log line in the console. These are convenience controls while iterating.
 
-The AutoHotkey script can `FileOpen("\\\\.\\pipe\\SwarmPipe", "w")` and `FileAppend` JSON lines. To receive events, open `SwarmPipeOut` for reading.
+### Script Cursor Integration
+When you add a script cursor (via hotkey or `{"cmd":"add","behavior":"script","script":"..."}`) the overlay:
+1. Allocates a cursor id (or uses provided id).
+2. Creates per-script pipe `\\.\\pipe\\SwarmScript_<id>` (inbound to overlay).
+3. Launches AutoHotkey: `<AutoHotkeyExe> "<scriptPath>" <id> \\.\pipe\SwarmScript_<id>`
+4. Emits events (`scriptLaunched`, then `scriptPipeConnected` when the script connects).
+
+Inside your AHK script you can open that pipe and send simple newline-delimited commands:
+```
+; Arguments: %1% = cursor id, %2% = pipe name
+id := %1%
+pipe := %2%
+fh := FileOpen(pipe, "w")
+fh.WriteLine("log script starting id=" id)
+Loop 200 {
+	x := 300 + A_Index*2
+	y := 400 + Sin(A_Index/10.0)*80
+	fh.WriteLine("pos " x " " y)
+	Sleep 16
+}
+fh.WriteLine("color #FF00AA")
+fh.WriteLine("log done")
+fh.Close()
+ExitApp
+```
+Supported script->overlay pipe commands:
+`pos <x> <y>` update cursor position
+`color #RRGGBB` change color
+`log <text>` send a log event
+`remove` self-remove the cursor
+
+You can change the AutoHotkey executable path at runtime:
+`{"cmd":"setAhk","path":"D:/Tools/AutoHotkey64.exe"}`
+
+The AutoHotkey script can still drive global overlay commands via the core `SwarmPipe` if it opens that pipe for writing JSON commands. To receive events, open `SwarmPipeOut` for reading.
 
 ## License
 TBD (choose MIT/Apache-2.0 recommended for openness).
