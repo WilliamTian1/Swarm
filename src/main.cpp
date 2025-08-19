@@ -103,6 +103,38 @@ public:
     }
 };
 
+// Draw a simple arrow (cursor-like) shape centered at (cx,cy)
+// size ~= overall height of arrow
+static void DrawCursorShape(HDC hdc, int cx, int cy, int size, COLORREF color) {
+    // Base arrow coordinates (approx Windows arrow) in a 28px height box, origin at (0,0)
+    // Points (x,y): tip at (0,0), down to (0,20), across to (6,14), to (11,28), (15,26), (9,13), (20,13), back to tip
+    POINT base[] = {
+        {0,0},{0,20},{6,14},{11,28},{15,26},{9,13},{20,13}
+    };
+    const int n = (int)(sizeof(base)/sizeof(base[0]));
+    double scale = size / 28.0; // scale height
+    // Determine width for centering (approx max x)
+    int maxX = 20; int maxY = 28;
+    int w = (int)(maxX * scale);
+    int h = (int)(maxY * scale);
+    int ox = cx - w/2; // shift so shape centered at (cx,cy)
+    int oy = cy - h/2;
+    POINT pts[16];
+    for(int i=0;i<n;i++) {
+        pts[i].x = (LONG)(ox + base[i].x * scale);
+        pts[i].y = (LONG)(oy + base[i].y * scale);
+    }
+    HBRUSH b = CreateSolidBrush(color);
+    HBRUSH old = (HBRUSH)SelectObject(hdc, b);
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    Polygon(hdc, pts, n);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+    SelectObject(hdc, old);
+    DeleteObject(b);
+}
+
 static SwarmManager gManager;
 static std::atomic<bool> gSolidMode {false};
 // (windowed/overlay mode flags removed in simplified always-overlay build)
@@ -439,12 +471,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 copy = gManager.cursors;
             }
             for(const auto &c : copy) {
-                HBRUSH b = CreateSolidBrush(c.color);
-                HBRUSH old = (HBRUSH)SelectObject(hdc, b);
-                int s = c.size;
-                Ellipse(hdc, c.pos.x - s/2, c.pos.y - s/2, c.pos.x + s/2, c.pos.y + s/2);
-                SelectObject(hdc, old);
-                DeleteObject(b);
+                DrawCursorShape(hdc, c.pos.x, c.pos.y, c.size, c.color);
             }
             if(gShowHelp) {
                 SetBkMode(hdc, TRANSPARENT);
